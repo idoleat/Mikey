@@ -4,6 +4,8 @@
 #include <sound/core.h>
 #include <sound/initval.h>
 #include <sound/pcm.h>
+#include <linux/timer.h>
+#include <linux/jiffies.h>
 
 MODULE_LICENSE("Dual BSD/GPL");
 MODULE_DESCRIPTION(
@@ -36,6 +38,7 @@ static int mikey_pcm_hw_free(struct snd_pcm_substream *substream);
 static int mikey_pcm_prepare(struct snd_pcm_substream *substream);
 static int mikey_pcm_trigger(struct snd_pcm_substream *substream, int cmd);
 static snd_pcm_uframes_t mikey_pcm_pointer(struct snd_pcm_substream *substream);
+static void mikey_timer_callback(struct timer_list *t);
 
 /* new pcm device */
 static int mikey_new_pcm(struct snd_card *card);
@@ -43,7 +46,11 @@ static int mikey_new_pcm(struct snd_card *card);
 struct mikey {
     struct snd_pcm *pcm;
     struct snd_card *card;
-    struct platform_device *pdev; /* do i really need this? */
+    struct platform_device *pdev;
+    struct timer_list timer;
+    unsigned int period_size;
+    unsigned int buffer_size;
+    unsigned int position;
 };
 
 static struct platform_device mikey_pdev = {.name = "Mikey",
@@ -153,7 +160,7 @@ static int mikey_probe_pdev(struct platform_device *pdev)
     err = snd_devm_card_new(&pdev->dev, index[pdev->id], id[pdev->id],
                             THIS_MODULE, sizeof(struct mikey), &card);
     if (err < 0) {
-        pr_err("Failed on creating a new cound card.");
+        pr_err("Failed on creating a new sound card.");
         return err;
     }
 
@@ -163,6 +170,9 @@ static int mikey_probe_pdev(struct platform_device *pdev)
     strcpy(card->driver, "Mikey Driver");
     strcpy(card->shortname, "mikey");
     strcpy(card->longname, "Mikey Virtual Driver");
+
+    timer_setup(&mike->timer, mikey_timer_callback, 0);
+    mike->position = 0;
 
     err = mikey_new_pcm(card);
     if (err < 0)
@@ -278,6 +288,11 @@ static int mikey_pcm_prepare(struct snd_pcm_substream *substream)
     /* The difference from hw_params is that the prepare callback will be called
      * each time snd_pcm_prepare() is called, i.e. when recovering after
      * underruns, etc. */
+    struct mikey *mike = substream->private_data;
+    struct snd_pcm_runtime *runtime = substream->runtime;
+    mike->position = 0;
+    mike->period_size = frames_to_bytes(runtime, runtime->period_size);
+    mike->buffer_size = frames_to_bytes(runtime, runtime->buffer_size);
     return 0;
 }
 
@@ -285,12 +300,15 @@ static int mikey_pcm_prepare(struct snd_pcm_substream *substream)
 static int mikey_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 {
     /* This is called when the PCM is started, stopped or paused. */
+    struct mikey *mike = substream->private_data;
     switch (cmd) {
     case SNDRV_PCM_TRIGGER_START:
-        /* do something to start the PCM engine */
+        /* Start the timer to simulate the hardware interrupt */
+        mod_timer(&mike->timer, jiffies + msecs_to_jiffies(10));
         break;
     case SNDRV_PCM_TRIGGER_STOP:
-        /* do something to stop the PCM engine */
+        /* Stop the timer */
+        del_timer_sync(&mike->timer);
         break;
     default:
         return -EINVAL;
@@ -311,8 +329,24 @@ static snd_pcm_uframes_t mikey_pcm_pointer(struct snd_pcm_substream *substream)
     calculates the available space, and wakes up the sleeping poll threads, etc.
 
     This callback is also atomic by default. */
+    struct mikey *mike = substream->private_data;
+    return bytes_to_frames(substream->runtime, mike->position);
+}
 
-    return bytes_to_frames(substream->runtime, 0);
+/* timer callback */
+static void mikey_timer_callback(struct timer_list *t)
+{
+    struct mikey *mike = from_timer(mike, t, timer);
+    struct snd_pcm_substream *substream = mike->pcm->streams[SNDRV_PCM_STREAM_PLAYBACK].substream;
+
+    mike->position += mike->period_size;
+    if (mike->position >= mike->buffer_size)
+        mike->position -= mike->buffer_size;
+
+    snd_pcm_period_elapsed(substream);
+
+    /* Restart the timer */
+    mod_timer(&mike->timer, jiffies + msecs_to_jiffies(10));
 }
 
 static int __init mod_init(void)
